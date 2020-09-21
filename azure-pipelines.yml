@@ -1,0 +1,254 @@
+# ASP.NET Core (.NET Framework)
+# Build and test ASP.NET Core projects targeting the full .NET Framework.
+# Add steps that publish symbols, save build artifacts, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/dotnet-core
+
+trigger:
+- master
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  SonarQube.Project.Key: 'hello-world'
+
+stages:
+    - stage: Build
+      condition: eq(variables['DoBuild'], 'true')
+      displayName: 'Build and Create Artifact'
+      jobs:
+        - job: 'Build_and_create_artifact'
+          pool:
+           vmImage: 'windows-latest'
+          continueOnError: false
+          steps:
+              - task: NuGetToolInstaller@1
+              
+              - task: NuGetCommand@2
+                displayName: 'Restore Nuget Packages'
+                inputs:
+                    restoreSolution: '$(solution)'
+
+              - task: SonarQubePrepare@4
+                displayName: 'Prepare Sonar Analysis'
+                inputs:
+                    SonarQube: 'SonarQube'
+                    scannerMode: MSBuild
+                    projectKey: '$(SonarQube.Project.Key)'
+                    projectName: '$(SonarQube.Project.Key)'
+                    projectVersion: '$(Build.BuildNumber)'
+                    extraProperties: |
+                        sonar.exclusions=**/*.bin,**/*.js
+
+              - task: DotNetCoreCLI@2
+                displayName: 'Build the solution'
+                inputs:
+                    command: build
+                    arguments: '--configuration $(buildConfiguration)'
+                    projects: '$(solution)'
+
+              - task: DotNetCoreCLI@2
+                displayName: 'Run Unit Test case and collect code coverage'
+                inputs:
+                    command: test
+                    arguments: '--no-restore --no-build --configuration $(buildConfiguration) --logger trx --collect:"Code Coverage"'
+                    projects: '**/*tests.csproj'
+
+              - task: SonarQubeAnalyze@4
+                displayName: 'Run Sonar Analysis'
+
+              - task: SonarQubePublish@4
+                displayName: 'Publish result to Sonar'
+                timeoutInMinutes: 300
+
+              - task: DotNetCoreCLI@2
+                displayName: 'Package Linux Artifacts'
+                inputs:
+                    command: publish
+                    arguments: '--configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)/Linux -r linux-x64'
+                    projects: '**/*.csproj'
+                    publishWebProjects: false
+
+              - task: DotNetCoreCLI@2
+                displayName: 'Package Windows Artifacts'
+                inputs:
+                    command: publish
+                    arguments: '--configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)/Windows'
+                    projects: '**/*.csproj'
+                    publishWebProjects: false
+                
+              - task: PublishBuildArtifacts@1
+                displayName: 'Upload artifact to AzureDevOps'
+                inputs:
+                    ArtifactName: 'artifact'
+                    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+                    
+    - stage: Docker
+      condition: eq(variables['DoDocker'], 'true')
+      displayName: Docker
+      variables:
+        ACR: 'devopsacrdevon'
+        DockerResourceGroup: 'DevOps-ACR'
+        AzureKeyVaultName: '$(ACR)-vault'
+        ACIName: 'devon-aci-api'
+      jobs:
+        - job: 
+          displayName: Docker Job
+          pool:
+           vmImage: 'ubuntu-latest'
+          steps:
+           - task: Docker@2
+             displayName: 'Upload to ACR'
+             inputs:
+                containerRegistry: 'Azure Container Registery'
+                repository: 'acr-api'
+                command: 'buildAndPush'
+                Dockerfile: '**/DockerFile'
+                tags: '$(Build.BuildNumber)'
+           - task: AzureCLI@2
+             displayName: 'Spin ACI Up'
+             inputs:
+               azureSubscription: 'Azure'
+               scriptType: 'pscore'
+               scriptLocation: 'inlineScript'
+               inlineScript: |
+                 az keyvault create --resource-group $(DockerResourceGroup) --name $(AzureKeyVaultName)
+                 
+                 # Create service principal, store its password in AKV (the registry *password*)
+                 az keyvault secret set --vault-name $(AzureKeyVaultName) --name "$(ACR)-pull-pwd" --value $(az ad sp create-for-rbac --name "$(ACR)-pull" --scopes $(az acr show --name $(ACR) --query id --output tsv) --role acrpull --query password --output tsv)
+                 
+                 # Store service principal ID in AKV (the registry *username*)
+                 az keyvault secret set --vault-name $(AzureKeyVaultName) --name "$(ACR)-pull-usr" --value $(az ad sp show --id "http://$(ACR)-pull" --query appId --output tsv)
+                 
+                 az container create --resource-group $(DockerResourceGroup) --name "$(ACIName)" `
+                     --image "$(ACR).azurecr.io/acr-api:$(Build.BuildNumber)" `
+                     --registry-login-server "$(ACR).azurecr.io" `
+                     --registry-username $(az keyvault secret show --vault-name $(AzureKeyVaultName) --name "$(ACR)-pull-usr" --query value -o tsv) `
+                     --registry-password $(az keyvault secret show --vault-name $(AzureKeyVaultName) --name "$(ACR)-pull-pwd" --query value -o tsv) `
+                     --dns-name-label "$(ACIName)" `
+                     --query "{FQDN:ipAddress.fqdn}" `
+                     --output table
+
+    - stage: Deploy
+      condition: eq(variables['DoAzure'], 'true')
+      displayName: Deploy to Azure
+      jobs:
+          - deployment: Azure
+            continueOnError: false
+            environment: 'Development'
+            variables:
+                LinuxWebAppName: 'DevOn-Linux-WebApp'
+                WindowsWebAppName: 'DevOn-Windows-WebApp'
+                LinuxResourceGroup: 'Linux'
+                WindowsResourceGroup: 'Windows'
+                AzureSubscription: 'Azure'
+            strategy:
+             runOnce:
+                 preDeploy: 
+                  steps:
+                  - task: AzurePowerShell@5
+                    displayName: 'Create the Windows resources'
+                    inputs:
+                      azureSubscription: 'Azure'
+                      ScriptType: 'InlineScript'
+                      Inline: |
+                        New-AzResourceGroup -Name $(WindowsResourceGroup) -Location eastus -force
+                        
+                        $AppServicePlan = New-AzAppServicePlan -Name Windows -Location eastus -Tier Basic -NumberofWorkers 1 -WorkerSize Small -ResourceGroupName $(WindowsResourceGroup)
+                        
+                        $WebApp = Get-AzWebApp -ResourceGroupName $(WindowsResourceGroup) -Name $(WindowsWebAppName) -ErrorAction SilentlyContinue
+                        
+                        $WebAppGui = Get-AzWebApp -ResourceGroupName $(WindowsResourceGroup) -Name "$(WindowsWebAppName)-GUI" -ErrorAction SilentlyContinue
+
+                        if($WebApp){Set-AzWebApp -ResourceGroupName $(WindowsResourceGroup) -Name $(WindowsWebAppName) -AppServicePlan $AppServicePlan.Name}
+                        else{New-AzWebApp -ResourceGroupName $(WindowsResourceGroup) -Name $(WindowsWebAppName) -Location eastus -AppServicePlan $AppServicePlan.Name}
+
+                        if($WebAppGui){Set-AzWebApp -ResourceGroupName $(WindowsResourceGroup) -Name "$(WindowsWebAppName)-GUI" -AppServicePlan $AppServicePlan.Name}
+                        else{New-AzWebApp -ResourceGroupName $(WindowsResourceGroup) -Name "$(WindowsWebAppName)-GUI" -Location eastus -AppServicePlan $AppServicePlan.Name}
+                      azurePowerShellVersion: 'LatestVersion'
+                  - task: AzurePowerShell@5
+                    displayName: 'Create Linux Resources'
+                    inputs:
+                      azureSubscription: 'Azure'
+                      ScriptType: 'InlineScript'
+                      Inline: |
+                        New-AzResourceGroup -Name $(LinuxResourceGroup) -Location eastus -force
+                        
+                        $AppServicePlan = New-AzResource -ResourceGroupName $(LinuxResourceGroup) -Location eastus -ResourceType microsoft.web/serverfarms -ResourceName Linux -kind linux -Properties @{reserved="true"} -Sku @{name="B1";tier="Basic"; size="B1"; family="B"; capacity="1"} -Force -OutVariable AppServicePlan
+                        
+                        $WebApp = Get-AzWebApp -ResourceGroupName $(LinuxResourceGroup) -Name $(LinuxWebAppName) -ErrorAction SilentlyContinue
+
+                        $WebAppGui = Get-AzWebApp -ResourceGroupName $(LinuxResourceGroup) -Name "$(LinuxWebAppName)-GUI" -ErrorAction SilentlyContinue
+
+                        if($WebApp){Set-AzWebApp -ResourceGroupName $(LinuxResourceGroup) -Name $(LinuxWebAppName) -AppServicePlan $AppServicePlan.Name}
+                        else{New-AzWebApp -ResourceGroupName $(LinuxResourceGroup) -Name $(LinuxWebAppName) -Location eastus -AppServicePlan $AppServicePlan.Name}
+
+                        if($WebAppGui){Set-AzWebApp -ResourceGroupName $(LinuxResourceGroup) -Name "$(LinuxWebAppName)-GUI" -AppServicePlan $AppServicePlan.Name}
+                        else{New-AzWebApp -ResourceGroupName $(LinuxResourceGroup) -Name "$(LinuxWebAppName)-GUI" -Location eastus -AppServicePlan $AppServicePlan.Name}
+                      azurePowerShellVersion: 'LatestVersion'
+
+                 deploy:
+                  pool:
+                   vmImage: 'windows-latest'
+                  steps:
+                      - task: AzureRmWebAppDeployment@4
+                        displayName: 'Deploy Windows API app'
+                        inputs:
+                          ConnectionType: 'AzureRM'
+                          azureSubscription: 'Azure'
+                          appType: 'webApp'
+                          WebAppName: '$(WindowsWebAppName)'
+                          VirtualApplication: '/'
+                          packageForLinux: '$(Agent.BuildDirectory)/artifact/Windows/api.zip'
+                          enableCustomDeployment: true
+                          DeploymentType: 'webDeploy'
+                          ExcludeFilesFromAppDataFlag: false
+                          RenameFilesFlag: false
+                      - task: AzureRmWebAppDeployment@4
+                        displayName: 'Deploy Windows Web app'
+                        inputs:
+                          ConnectionType: 'AzureRM'
+                          azureSubscription: 'Azure'
+                          appType: 'webApp'
+                          WebAppName: '$(WindowsWebAppName)-GUI'
+                          VirtualApplication: '/'
+                          packageForLinux: '$(Agent.BuildDirectory)/artifact/Windows/web.zip'
+                          enableCustomDeployment: true
+                          DeploymentType: 'webDeploy'
+                          ExcludeFilesFromAppDataFlag: false
+                          RenameFilesFlag: false
+                      - task: AzureRmWebAppDeployment@4
+                        displayName: 'Deploy Linux API app'
+                        inputs:
+                          ConnectionType: 'AzureRM'
+                          azureSubscription: 'Azure'
+                          appType: 'webAppLinux'
+                          WebAppName: '$(LinuxWebAppName)'
+                          packageForLinux: '$(Agent.BuildDirectory)/artifact/Linux/api.zip'
+                          RuntimeStack: 'DOTNETCORE|3.0'
+                      - task: AzureRmWebAppDeployment@4
+                        displayName: 'Deploy Linux Web app'
+                        inputs:
+                          ConnectionType: 'AzureRM'
+                          azureSubscription: 'Azure'
+                          appType: 'webAppLinux'
+                          WebAppName: '$(LinuxWebAppName)'
+                          packageForLinux: '$(Agent.BuildDirectory)/artifact/Linux/web.zip'
+                          RuntimeStack: 'DOTNETCORE|3.0'                          
+                 on:
+                     success:
+                         steps:
+                             - script: echo Notify! This is on success
+                     failure:
+                         steps:
+                            - task: AzurePowerShell@5
+                              inputs:
+                                azureSubscription: 'Azure'
+                                ScriptType: 'InlineScript'
+                                Inline: |
+                                    Remove-AzResourceGroup -Name $(WindowsResourceGroup) -Force
+                                    Remove-AzResourceGroup -Name $(LinuxResourceGroup) -Force
+                                azurePowerShellVersion: 'LatestVersion'
